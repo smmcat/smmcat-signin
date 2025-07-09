@@ -3,9 +3,10 @@ import { } from 'koishi-plugin-puppeteer'
 import { getOrCreateFile, setOrCreateFile } from './fileUtils';
 import { makeFromDataData, decideTimeOfNextDay, countContinuousCheckInDays } from './dateUtils';
 import { html } from './html';
+import fs from 'fs/promises'
 
 import type { } from 'koishi-plugin-monetary'
-import path from 'path';
+import path, { resolve } from 'path';
 
 export const name = 'smmcat-signin'
 
@@ -15,6 +16,8 @@ export interface Config {
   max: number,
   showCalendar: boolean
   atQQ: boolean
+  useDatabase: boolean
+  showTransfer: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -23,7 +26,29 @@ export const Config: Schema<Config> = Schema.object({
   min: Schema.number().default(20).description('签到获得的最小值'),
   max: Schema.number().default(50).description('签到获得的最大值'),
   atQQ: Schema.boolean().default(false).description('回复消息附带 @发送者 [兼容操作]'),
+  useDatabase: Schema.boolean().default(false).description('使用Koishi数据库！'),
+  showTransfer: Schema.boolean().default(false).description('显示 /签到数据转移 指令，(用于本地文件数据迁移至数据库)')
 })
+
+export type smm_signin_dateItem = { day: string, time: string }
+
+export type UserSotreData = {
+  lastTime: smm_signin_dateItem | null
+  total: number,
+  history: smm_signin_dateItem[]
+}
+
+export type smm_signinData = UserSotreData & {
+  id: number
+  userId: string
+}
+
+// 扩展 Koishi 的数据库表类型声明
+declare module 'koishi' {
+  interface Tables {
+    smm_signin: smm_signinData
+  }
+}
 
 export const inject = {
   required: ['monetary', 'database'],
@@ -32,13 +57,54 @@ export const inject = {
 
 export function apply(ctx: Context, config: Config) {
 
+
+  if (config.useDatabase) {
+    ctx.model.extend(
+      'smm_signin',
+      {
+        id: 'unsigned',
+        userId: 'string',
+        lastTime: 'object',
+        total: 'integer',
+        history: 'array'
+      },
+      {
+        primary: 'id',
+        autoInc: true
+      }
+    )
+  }
+
   // 写入 koishi 下的目标路径文件
-  async function setBaseDirStoreData(upath: string, data: object) {
+  async function setBaseDirStoreData(upath: string, data: smm_signinData, userId: string) {
+    // 使用数据库
+    if (config.useDatabase) {
+      const [userInfo] = await ctx.database.get('smm_signin', { userId })
+      if (!userInfo) {
+        const init_data = { ...data, userId }
+        await ctx.database.create('smm_signin', init_data)
+        return
+      }
+      delete data.id
+      await ctx.database.set('smm_signin', { userId }, { ...data, userId })
+      return
+    }
     return await setOrCreateFile(path.join(ctx.baseDir, upath), JSON.stringify(data));
   }
 
   // 获取 koishi 下的目标路径文件
-  async function getBaseDirStoreData(upath: string) {
+  async function getBaseDirStoreData(upath: string, userId: string) {
+
+    // 使用数据库
+    if (config.useDatabase) {
+      const [data] = await ctx.database.get('smm_signin', { userId })
+      if (!data) {
+        const init_data = { lastTime: null, total: 0, history: [], userId }
+        await ctx.database.create('smm_signin', init_data)
+        return init_data
+      }
+      return data
+    }
     const data = await getOrCreateFile(path.join(ctx.baseDir, upath))
     return JSON.parse(data);
   }
@@ -47,15 +113,10 @@ export function apply(ctx: Context, config: Config) {
     return Math.floor(Math.random() * (max - min) + min);
   }
 
-  type UserSotreData = {
-    lastTime: { day: string, time: string },
-    total: number,
-    history: { day: string, time: string }[]
-  }
 
   // 尝试进行签到
-  async function getUsersigninData(userId: string, fn?: (data: UserSotreData) => void) {
-    let data: UserSotreData = await getBaseDirStoreData(path.join(config.signinPath, `./${userId}.json`));
+  async function getUsersigninData(userId: string, fn?: (data: UserSotreData | smm_signinData) => void) {
+    let data: UserSotreData = await getBaseDirStoreData(path.join(config.signinPath, `./${userId}.json`), userId);
 
 
     // 获取当前日期
@@ -75,7 +136,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       data.history.push(time);
-      await setBaseDirStoreData(path.join(config.signinPath, `./${userId}.json`), data);
+      await setBaseDirStoreData(path.join(config.signinPath, `./${userId}.json`), data as smm_signinData, userId);
       fn && fn(data)
       return [true, countContinuousCheckInDays(data.history.map(item => item.day))];
     } else {
@@ -128,7 +189,7 @@ export function apply(ctx: Context, config: Config) {
       at = `<at id="${session.userId}" />`
     }
 
-    let data = await getBaseDirStoreData(path.join(config.signinPath, `./${session.userId}.json`));
+    let data = await getBaseDirStoreData(path.join(config.signinPath, `./${session.userId}.json`), session.userId);
 
     if (!Object.keys(data).length) {
       data = { lastTime: null, total: 0, history: [] }
@@ -196,7 +257,7 @@ export function apply(ctx: Context, config: Config) {
 
     let img = ''
     if (config.showCalendar && ctx.puppeteer) {
-      img = await ctx.puppeteer.render(html.createCalendar(data.history))
+      img = await ctx.puppeteer.render(html.createCalendar(data.history || []))
     }
 
     await session.send(img + at + timeInfo + `\n\n本周连续签到: ${weekTime}\n` + `总签到次数: ${data.total}`);
@@ -222,5 +283,52 @@ export function apply(ctx: Context, config: Config) {
     if (nightTime.includes(hours)) return '晚上好！';
 
     return '好久不见~';
+  }
+
+
+  if (config.showTransfer) {
+    ctx
+      .command('签到数据转移')
+      .action(async ({ session }) => {
+        if (!config.useDatabase) {
+          return `请把插件配置中 useDatabase 选项开启后再使用该指令。`
+        }
+        const upath = path.join(ctx.baseDir, config.signinPath)
+        try {
+          await fs.access(upath)
+        } catch (error) {
+          await fs.mkdir(upath, { recursive: true })
+        }
+        const dirList = (await fs.readdir(upath)).map(item => path.basename(item, path.extname(item)))
+        const dict = { ok: 0, err: 0, repeat: [] }
+        const eventList = dirList.map((userId) => {
+          return new Promise(async (resolve, reject) => {
+            try {
+              const userPath = path.join(ctx.baseDir, config.signinPath, `./${userId}.json`)
+              const data = JSON.parse(await getOrCreateFile(userPath))
+              const [userData] = await ctx.database.get('smm_signin', { userId })
+              if (!userData) {
+                const initData = {
+                  ...data,
+                  userId
+                }
+                await ctx.database.create('smm_signin', initData)
+                // await fs.unlink(userPath)
+                dict.ok++
+              } else {
+                dict.repeat.push(userId)
+              }
+              resolve(true)
+            } catch (error) {
+              dict.err++
+              console.log(error);
+              resolve(true)
+            }
+          })
+        })
+        await Promise.all(eventList)
+        console.log('存在冲突项:' + dict.repeat.join('、') + '\n请移除数据库指定数据，或者手动迁移该用户数据至数据库。');
+        await session.send(`数据迁移完成，成功${dict.ok}个，失败${dict.err}个` + `${dict.repeat.length ? `，\n另外有${dict.repeat.length}个冲突项需要手动解决。` : '。'}`)
+      })
   }
 }
