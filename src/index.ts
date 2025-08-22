@@ -10,6 +10,78 @@ import path, { resolve } from 'path';
 
 export const name = 'smmcat-signin'
 
+export const usage = `
+***
+自定义回复可使用对应的转义符，具体规则如下：
+
+**签到成功 - 连续签到**
+
+支持的转义符
+
+|转义符|说明|
+|:-:|:-:|
+|%sayHi%|问候语|
+|%br%|换行|
+|%day%|对应连续签到天数，如没有则返回空|
+|%points%|原打算获得的积分（并非总获得）|
+|%add_points%|额外获得的积分|
+|%all_points%|总获得积分|
+|%calendar%|展示图片日历|
+
+举例
+
+\`\`\`
+你已经连续签到 %day%，系统额外奖励你 %add_points% 积分。\\n
+
+一共获得 %all_points% 积分。
+\`\`\`
+输出结果
+\`\`\`
+你已经连续签到 3天，系统额外奖励你 10 积分。
+
+一共获得 32 积分。
+\`\`\`
+
+**签到成功 - 非连续签到**
+
+|转义符|说明|
+|:-:|:-:|
+|%sayHi%|问候语|
+|%br%|换行|
+|%points%|总获得积分|
+|%calendar%|图片日历|
+
+**举例**
+
+\`\`\`
+签到成功，获得 %all_points% 积分。
+\`\`\`
+**输出结果**
+\`\`\`
+签到成功，获得 12 积分。
+\`\`\`
+
+**重复签到**
+
+|转义符|说明|
+|:-:|:-:|
+|%sayHi%|问候语|
+|%br%|换行|
+|%calendar%|图片日历|
+
+举例
+
+\`\`\`
+你今天已经签到过了哦~
+\`\`\`
+输出结果
+\`\`\`
+你今天已经签到过了哦~
+\`\`\`
+
+***
+`
+
 export interface Config {
   signinPath: string,
   min: number,
@@ -18,6 +90,11 @@ export interface Config {
   atQQ: boolean
   useDatabase: boolean
   showTransfer: boolean
+  signin_one: string
+  signin_continuous: string
+  signin_repeat: string
+  pointName: string
+  useAlone: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -25,9 +102,14 @@ export const Config: Schema<Config> = Schema.object({
   showCalendar: Schema.boolean().default(false).description("显示签到日历 [需要使用 puppeteer]"),
   min: Schema.number().default(20).description('签到获得的最小值'),
   max: Schema.number().default(50).description('签到获得的最大值'),
+  signin_one: Schema.string().description('非连续签到的自定义提示（为空则默认）'),
+  signin_continuous: Schema.string().description('连续签到的自定义提示（为空则默认）'),
+  signin_repeat: Schema.string().description('重复签到的自定义提示（为空则默认）'),
   atQQ: Schema.boolean().default(false).description('回复消息附带 @发送者 [兼容操作]'),
+  pointName: Schema.string().default('积分').description('自定义积分名'),
   useDatabase: Schema.boolean().default(false).description('使用Koishi数据库！'),
-  showTransfer: Schema.boolean().default(false).description('显示 /签到数据转移 指令，(用于本地文件数据迁移至数据库)')
+  showTransfer: Schema.boolean().default(false).description('显示 /签到数据转移 指令，(用于本地文件数据迁移至数据库)'),
+  useAlone: Schema.boolean().default(false).description('独立的积分结算（仅作用于某些多积分系统）'),
 })
 
 export type smm_signin_dateItem = { day: string, time: string }
@@ -73,6 +155,65 @@ export function apply(ctx: Context, config: Config) {
         autoInc: true
       }
     )
+  }
+
+  type Escape = {
+    format(mapData: EscapeQuery_continuous): string
+    format(mapData: EscapeQuery): string
+    format(mapData: EscapeQuery_repeat): string
+  }
+
+  type EscapeQuery_continuous = {
+    type?: 'continuous';
+    day: string;
+    points: number;
+    add_points: number;
+    all_points: number;
+    addRatio: number;
+    calendar: any;
+  }
+
+  type EscapeQuery_repeat = {
+    type?: 'repeat';
+    calendar: any;
+    [key: string]: any;
+  }
+
+  type EscapeQuery = {
+    type?: 'base';
+    points: number;
+    calendar: any;
+  }
+
+  const secapeFn = {
+    sayHi,
+    day: (e: number) => e ? e : '',
+    points: (e: number) => e ? e + config.pointName : '',
+    add_points: (e: number) => e ? e + config.pointName : '',
+    all_points: (e: number) => e + config.pointName,
+    calendar: (e: string) => e ? e : '',
+    addRatio: (e: number) => e ? e + '%' : '',
+    br: () => '\n',
+    getText: (str: string, mapData: any) => str?.replace(/%(\w+)%/g, (match, key) => {
+      return secapeFn[key] ? secapeFn[key](mapData[key]) : ''
+    })
+  }
+
+  const escape: Escape = {
+    format(mapData: EscapeQuery_continuous | EscapeQuery_repeat | EscapeQuery): string {
+      // 连续签到
+      if (mapData.type == 'continuous') {
+        return config.signin_continuous ? secapeFn.getText(config.signin_continuous, mapData) : `${mapData.calendar ? mapData.calendar : ''}` + sayHi() + `签到成功，获得 ${mapData.points} ${config.pointName}。` + `\n\n因您本周连续签到 ${mapData.day}天，额外奖励您 ${mapData.addRatio}% 的${config.pointName}。因此一共获得：${mapData.all_points} ${config.pointName}`;
+      }
+      // 单次签到
+      else if (mapData.type == 'base') {
+        return config.signin_one ? secapeFn.getText(config.signin_one, mapData) : `${mapData.calendar ? mapData.calendar : ''}` + sayHi() + `签到成功，获得 ${mapData.points} ${config.pointName}。`;
+      }
+      // 重复签到
+      else {
+        return secapeFn.getText(config.signin_repeat, mapData) || '你今日已经签到过了哦~';
+      }
+    }
   }
 
   // 写入 koishi 下的目标路径文件
@@ -158,29 +299,48 @@ export function apply(ctx: Context, config: Config) {
       userData = data
     });
 
+    let queryData: any = {}
+    if (config.showCalendar && ctx.puppeteer) {
+      queryData.calendar = await ctx.puppeteer.render(html.createCalendar((userData as UserSotreData).history))
+    }
+
     if (!type[0]) {
-      await session.send(at + '你今日已经签到过了哦~');
+      await session.send(at + escape.format(queryData));
       return
     }
 
-    let msg = sayHi();
-
     let num = random(config.min, config.max);
-    msg += `签到成功，获得 ${num} 积分。`;
+    queryData.points = num
+    queryData.type = 'base'
 
     if (Number(type[1]) > 1) {
       let up = [0, 0.1, 0.1, 0.2, 0.3, 0.5, 0.5];
-      num = num + Math.floor(num * up[Number(type[1]) - 1]);
-      msg += `\n\n因您本周连续签到 ${type[1]} 天，额外奖励您 ${up[Number(type[1]) - 1] * 100}% 的积分。因此一共获得：${num} 积分`
+      queryData.day = type[1]
+      queryData.add_points = num + Math.floor(num * up[Number(type[1]) - 1]);
+      queryData.addRatio = up[Number(type[1]) - 1] * 100
+      queryData.all_points = queryData.add_points + queryData.points
+      queryData.type = 'continuous'
     }
 
-    let img = ''
-    if (config.showCalendar && ctx.puppeteer) {
-      img = await ctx.puppeteer.render(html.createCalendar((userData as UserSotreData).history))
+    // 开启积分独立
+    if (config.useAlone) {
+      const [userData] = await ctx.database.get('monetary', { uid: session.user.id, currency: config.pointName })
+      if (!userData) {
+        await ctx.database.create('monetary', {
+          uid: session.user.id,
+          currency: config.pointName,
+          value: num
+        })
+      } else {
+        userData.value += num
+        await ctx.database.set('monetary', { uid: session.user.id, currency: config.pointName }, userData)
+      }
     }
-
-    await ctx.monetary.gain(session.user.id, num);
-    await session.send(img + at + msg);
+    // 不使用积分独立
+    else {
+      await ctx.monetary.gain(session.user.id, num);
+    }
+    await session.send(at + escape.format(queryData));
   })
 
   ctx.command('签到历史', '查看签到历史').action(async ({ session }) => {
@@ -275,14 +435,14 @@ export function apply(ctx: Context, config: Config) {
     const pmTime = [14, 15, 16, 17, 18, 19] // 下午
     const nightTime = [20, 21] // 晚上
 
-    if (lastNightTime.includes(hours)) return '深夜好,注意休息哦~';
-    if (morningTime.includes(hours)) return '早上好！';
-    if (noonTime.includes(hours)) return '中午好！';
-    if (pmTime.includes(hours)) return '下午好！';
-    if (amTime.includes(hours)) return '上午好！';
-    if (nightTime.includes(hours)) return '晚上好！';
+    if (lastNightTime.includes(hours)) return '深夜好,注意休息哦~ ';
+    if (morningTime.includes(hours)) return '早上好！ ';
+    if (noonTime.includes(hours)) return '中午好！ ';
+    if (pmTime.includes(hours)) return '下午好！ ';
+    if (amTime.includes(hours)) return '上午好！ ';
+    if (nightTime.includes(hours)) return '晚上好！ ';
 
-    return '好久不见~';
+    return '好久不见~ ';
   }
 
 

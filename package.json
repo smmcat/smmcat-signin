@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-smmcat-signin",
   "description": "纯粹的签到功能",
-  "version": "0.3.3",
+  "version": "0.3.7",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
